@@ -8,6 +8,7 @@ package speedtest
 
 import (
 	"fmt"
+	"net"
 	"sync"
 	"time"
 
@@ -180,4 +181,21 @@ func Best(results []Result) (Result, bool) {
 		return Result{}, false
 	}
 	return results[0], true
+}
+
+// IsIPv6 判断地址是否为 IPv6（IPv4-mapped 形式按 IPv4 计）。
+func IsIPv6(ip string) bool {
+	p := net.ParseIP(ip)
+	return p != nil && p.To4() == nil
+}
+
+// BestOfFamily 返回结果列表中指定地址族的排名最高项
+// （调用方传入的结果需已按排名排序，如 Run 的返回值或合并排序后的列表）。
+func BestOfFamily(results []Result, ipv6 bool) (Result, bool) {
+	for _, r := range results {
+		if IsIPv6(r.IP) == ipv6 {
+			return r, true
+		}
+	}
+	return Result{}, false
 }

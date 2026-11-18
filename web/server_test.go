@@ -134,13 +134,13 @@ func TestWatchdogProbeAndRotate(t *testing.T) {
 		t.Error("本地 listener 应探测可达")
 	}
 
-	// 2. candidateIPs 返回测速结果前 5 名
+	// 2. candidateIPs 返回测速结果前 5 名（IPv4 车道）
 	s.mu.Lock()
 	for i := 0; i < 8; i++ {
 		s.status.Results = append(s.status.Results, speedtest.Result{IP: fmt.Sprintf("10.0.0.%d", i)})
 	}
 	s.mu.Unlock()
-	got := s.candidateIPs()
+	got := s.candidateIPs(false)
 	if len(got) != 5 || got[0] != "10.0.0.0" {
 		t.Errorf("candidateIPs 应返回前 5 名，实际 %v", got)
 	}
@@ -330,7 +330,7 @@ func TestAddDomainRemovesConflictingManualRewrites(t *testing.T) {
 
 // 包含子域的域名应同时写入裸域名与 *. 通配两条记录；未包含子域的清理 *. 残留。
 func TestBuildWantWildcardBothForms(t *testing.T) {
-	want := buildWant([]string{"*.a.com", "b.com"}, "1.1.1.1")
+	want := buildWant([]string{"*.a.com", "b.com"}, []string{"1.1.1.1"})
 	if !want["*.a.com"]["1.1.1.1"] {
 		t.Error("通配形式应写入 IP")
 	}
@@ -439,5 +439,153 @@ func TestAddFileBasedInstance(t *testing.T) {
 	// API 型实例仍然要求 url
 	if rr := post(`{"type":"adguard","url":""}`); rr.Code != http.StatusBadRequest {
 		t.Errorf("API 型缺 url 应 400，got %d", rr.Code)
+	}
+}
+
+// ---- 双栈优选（v4/v6 分族选优）回归 ----
+
+// TestIsIPv6AndBestOfFamily 地址族判定与分族选优。
+func TestIsIPv6AndBestOfFamily(t *testing.T) {
+	cases := []struct {
+		ip string
+		v6 bool
+	}{
+		{"104.20.50.16", false},
+		{"2606:4700::6810:3210", true},
+		{"::ffff:104.20.50.16", false}, // IPv4-mapped 按 IPv4 计
+		{"bad-ip", false},
+	}
+	for _, c := range cases {
+		if got := speedtest.IsIPv6(c.ip); got != c.v6 {
+			t.Errorf("IsIPv6(%q) = %v, want %v", c.ip, got, c.v6)
+		}
+	}
+	mixed := []speedtest.Result{
+		{IP: "104.20.50.16"},
+		{IP: "2606:4700::1"},
+		{IP: "104.20.50.18"},
+		{IP: "2606:4700::2"},
+	}
+	if r, ok := speedtest.BestOfFamily(mixed, true); !ok || r.IP != "2606:4700::1" {
+		t.Errorf("BestOfFamily(v6) 应取首个 v4 后的族内最高，got %+v ok=%v", r, ok)
+	}
+	if r, ok := speedtest.BestOfFamily(mixed, false); !ok || r.IP != "104.20.50.16" {
+		t.Errorf("BestOfFamily(v4) 应取首个，got %+v ok=%v", r, ok)
+	}
+	if _, ok := speedtest.BestOfFamily([]speedtest.Result{{IP: "1.2.3.4"}}, true); ok {
+		t.Error("无 v6 结果时 BestOfFamily(v6) 应返回 false")
+	}
+}
+
+// TestBuildWantDualAnswers 双栈答案集：通配域名两种形式都应携带全部答案。
+func TestBuildWantDualAnswers(t *testing.T) {
+	want := buildWant([]string{"*.a.com"}, []string{"1.2.3.4", "2606:4700::1"})
+	if !want["*.a.com"]["1.2.3.4"] || !want["*.a.com"]["2606:4700::1"] {
+		t.Errorf("通配形式应携带 v4+v6: %v", want["*.a.com"])
+	}
+	if !want["a.com"]["1.2.3.4"] || !want["a.com"]["2606:4700::1"] {
+		t.Errorf("裸域名形式应同样携带 v4+v6: %v", want["a.com"])
+	}
+	if len(want) != 2 {
+		t.Errorf("应恰好 2 条记录，实际 %d", len(want))
+	}
+	// 未含子域的裸域名：答案只在裸域名上，通配形式为空集（清理语义）
+	want = buildWant([]string{"a.com"}, []string{"1.2.3.4"})
+	if len(want["a.com"]) != 1 || len(want["*.a.com"]) != 0 {
+		t.Errorf("裸域名: %v, 通配应为空集: %v", want["a.com"], want["*.a.com"])
+	}
+	// 空 IP 序列不产生答案（退化为清理语义）
+	want = buildWant([]string{"a.com"}, nil)
+	if len(want["a.com"]) != 0 {
+		t.Errorf("空答案序列应为空集: %v", want["a.com"])
+	}
+}
+
+// TestAnswersForInstance 按实例类型分流：文件型双栈双写，API 型 v4 优先单条。
+func TestAnswersForInstance(t *testing.T) {
+	file := config.AdguardInstance{Type: "smartdns"}
+	api := config.AdguardInstance{Type: "adguard"}
+	legacy := config.AdguardInstance{} // 旧配置无 type，按 AdGuard 处理
+
+	got := answersForInstance(file, "1.2.3.4", "2606:4700::1")
+	if len(got) != 2 || got[0] != "1.2.3.4" || got[1] != "2606:4700::1" {
+		t.Errorf("文件型应同时返回 v4+v6: %v", got)
+	}
+	got = answersForInstance(api, "1.2.3.4", "2606:4700::1")
+	if len(got) != 1 || got[0] != "1.2.3.4" {
+		t.Errorf("API 型应 v4 优先单条: %v", got)
+	}
+	got = answersForInstance(legacy, "1.2.3.4", "2606:4700::1")
+	if len(got) != 1 || got[0] != "1.2.3.4" {
+		t.Errorf("无 type 旧配置应按 API 型处理: %v", got)
+	}
+	// 纯 v6 网络：API 型退化为 v6；文件型只写 v6
+	if got := answersForInstance(api, "", "2606:4700::1"); len(got) != 1 || got[0] != "2606:4700::1" {
+		t.Errorf("API 型无 v4 时应退化 v6: %v", got)
+	}
+	if got := answersForInstance(file, "", "2606:4700::1"); len(got) != 1 || got[0] != "2606:4700::1" {
+		t.Errorf("文件型无 v4 时应只写 v6: %v", got)
+	}
+	if got := answersForInstance(api, "", ""); len(got) != 0 {
+		t.Errorf("两族皆空应返回空: %v", got)
+	}
+}
+
+// TestLaneIPsFallback 双车道取值口径：接管值 → 该族测速最优 → 持久化结果，
+// 且 IPv6 车道不得被 IPv4 的整体最优污染。
+func TestLaneIPsFallback(t *testing.T) {
+	t.Setenv("DSA_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	s, err := New(newTestConfig(), "password123", mustParseCIDRs(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 空状态：双车道皆空
+	if ip4, ip6 := s.laneIPs(); ip4 != "" || ip6 != "" {
+		t.Errorf("空状态应返回空车道: %q / %q", ip4, ip6)
+	}
+	// 混合结果 + 持久化值：接管值优先
+	s.mu.Lock()
+	s.activeIP = "104.20.50.16"
+	s.activeIP6 = "2606:4700::9"
+	s.cfg.LastResultIP = "104.20.50.99"
+	s.cfg.LastResultIP6 = "2606:4700::99"
+	s.mu.Unlock()
+	if ip4, ip6 := s.laneIPs(); ip4 != "104.20.50.16" || ip6 != "2606:4700::9" {
+		t.Errorf("接管值应优先: %q / %q", ip4, ip6)
+	}
+	// 无接管值：按族取测速最优（混排列表中取族内第一），不互相污染
+	s.mu.Lock()
+	s.activeIP, s.activeIP6 = "", ""
+	s.status.Results = []speedtest.Result{
+		{IP: "104.20.50.16"},
+		{IP: "2606:4700::1"},
+		{IP: "104.20.50.18"},
+	}
+	s.mu.Unlock()
+	if ip4, ip6 := s.laneIPs(); ip4 != "104.20.50.16" || ip6 != "2606:4700::1" {
+		t.Errorf("应按族取测速最优: %q / %q", ip4, ip6)
+	}
+	// 无内存结果：回退持久化
+	s.mu.Lock()
+	s.status.Results = nil
+	s.mu.Unlock()
+	if ip4, ip6 := s.laneIPs(); ip4 != "104.20.50.99" || ip6 != "2606:4700::99" {
+		t.Errorf("应回退持久化结果: %q / %q", ip4, ip6)
+	}
+}
+
+// TestWantForInstanceDual 文件型实例的期望集合应含 v4+v6，且手动规则并入同域集合。
+func TestWantForInstanceDual(t *testing.T) {
+	inst := config.AdguardInstance{
+		Type:           "mosdns",
+		URL:            "file:///tmp/x.hosts",
+		ManualRewrites: []config.ManualRewrite{{Domain: "a.com", Answer: "10.0.0.1"}},
+	}
+	want := wantForInstance([]string{"a.com"}, []string{"1.2.3.4", "2606:4700::1"}, inst)
+	if !want["a.com"]["1.2.3.4"] || !want["a.com"]["2606:4700::1"] || !want["a.com"]["10.0.0.1"] {
+		t.Errorf("期望集合应合并双栈答案与手动规则: %v", want["a.com"])
+	}
+	if len(want["*.a.com"]) != 0 {
+		t.Errorf("未含子域时通配形式应为空集: %v", want["*.a.com"])
 	}
 }

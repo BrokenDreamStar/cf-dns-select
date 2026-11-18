@@ -53,7 +53,7 @@ export default function StatusPage() {
         <div className="stat-row">
           {top3.length ? top3.map((r, i) => (
             <div className="stat" key={i}>
-              <div className="label">#{i + 1} {i === 0 ? '最快 IP' : '候选'}</div>
+              <div className="label">#{i + 1} {i === 0 ? (r.ip.includes(':') ? '最快 IPv6' : '最快 IPv4') : '候选'}</div>
               <div className={'value mono' + (i === 0 ? ' ok' : '')}>{r.ip}</div>
               <div className="label" style={{ marginTop: 4 }}>
                 {r.delay_ms.toFixed(1)} ms · {r.speed_mbps.toFixed(2)} MB/s{r.colo ? ' · ' + r.colo : ''}
@@ -61,6 +61,15 @@ export default function StatusPage() {
             </div>
           )) : (
             <div className="stat"><div className="label">最快 IP</div><div className="value mono">—</div></div>
+          )}
+          {status.best_ip6 && (
+            <div className="stat">
+              <div className="label">最快 IPv6</div>
+              <div className="value mono ok">{status.best_ip6}</div>
+              <div className="label" style={{ marginTop: 4 }}>
+                {status.best_ip6_delay_ms ? status.best_ip6_delay_ms.toFixed(1) + ' ms' : '双栈优选'}
+              </div>
+            </div>
           )}
         </div>
         <div className="actions">

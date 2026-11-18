@@ -42,6 +42,8 @@ type Status struct {
 	BestDelayMs    float64             `json:"best_delay_ms,omitempty"`
 	BestSpeedMBps  float64             `json:"best_speed_mbps,omitempty"`
 	BestColo       string              `json:"best_colo,omitempty"`
+	BestIP6        string              `json:"best_ip6,omitempty"` // IPv6 地址族最优（仅 test_ipv6 开启时有值）
+	BestIP6DelayMs float64             `json:"best_ip6_delay_ms,omitempty"`
 	Results        []speedtest.Result  `json:"results,omitempty"`
 	WrittenDomains []WrittenDomain     `json:"written_domains,omitempty"`
 }
@@ -53,6 +55,7 @@ type RunRecord struct {
 	OK        bool               `json:"ok"`
 	Error     string             `json:"error,omitempty"`
 	BestIP    string             `json:"best_ip,omitempty"`
+	BestIP6   string             `json:"best_ip6,omitempty"` // IPv6 地址族最优
 	DelayMs   float64            `json:"delay_ms,omitempty"`
 	SpeedMBps float64            `json:"speed_mbps,omitempty"`
 	Colo      string             `json:"colo,omitempty"`
@@ -89,8 +92,9 @@ type Server struct {
 	runners   sync.WaitGroup // P0-2：跟踪在途测速任务，供优雅关闭等待
 	syncState syncJob        // P1-7：实例同步异步任务状态
 
-	// 可达性守护协程状态（单 IP 写入策略下的故障轮换）
-	activeIP      string        // 当前写入实例的生效 IP（可能已从最优轮换到备选）
+	// 可达性守护协程状态（双栈分车道故障轮换：IPv4 / IPv6 各自独立维护生效 IP）
+	activeIP      string        // IPv4 车道当前生效 IP（可能已从最优轮换到备选）
+	activeIP6     string        // IPv6 车道当前生效 IP（仅 test_ipv6 开启时非空）
 	failStreak    int           // 连续触发测速但无可用结果的次数（指数退避依据）
 	backoffUntil  time.Time     // 退避截止时间：在此之前不再重复触发测速
 	watchdogStop  chan struct{} // 可达性守护协程停止信号
@@ -383,26 +387,17 @@ func (s *Server) handleDomainWildcard(w http.ResponseWriter, r *http.Request) {
 	// 元数据不存在时自动创建（如 fresh start 时内置的默认域名尚无元数据）
 	s.cfg.SetDomainWildcard(domain, in.Wildcard)
 	saveErr := s.cfg.Save()
-	active := s.activeIP
-	results := append([]speedtest.Result(nil), s.status.Results...)
 	insts := append([]config.AdguardInstance(nil), s.cfg.AdguardInstances...)
 	domains := s.expandDomains(s.cfg.CustomDomains, s.cfg.DomainMetas)
-	lastIP := s.cfg.LastResultIP
 	s.mu.Unlock()
 	reportSaveError(w, saveErr)
 
 	// 立即用新形式重写全部实例（旧形式会被 SyncRewrites 的清理逻辑移除）。
 	// P2-1：后台执行，避免单个不可达实例（15s×3 重试）阻塞本次请求。
-	ip := active
-	if ip == "" && len(results) > 0 {
-		ip = results[0].IP
-	}
-	if ip == "" {
-		ip = lastIP // 重启后无内存结果时回退持久化的最近结果
-	}
 	go func() {
+		ip4, ip6 := s.laneIPs()
 		for _, inst := range insts {
-			want := wantForInstance(domains, ip, inst)
+			want := wantForInstance(domains, answersForInstance(inst, ip4, ip6), inst)
 			if len(want) == 0 {
 				continue
 			}
@@ -803,15 +798,25 @@ func (s *Server) managedDomainSet() map[string]bool {
 	return set
 }
 
-// buildWant 构造期望重写集合：每个展开后的域名形式写入指定 IP。
+// buildWant 构造期望重写集合：每个展开后的域名形式写入指定答案集（IPv4/IPv6 双栈时可含两条）。
 // 包含子域（*.domain）的域名同时写裸域名与通配两条记录；未包含子域的
 // 域名把 *. 形式置为空集，SyncRewrites 的接管语义会清除其残留记录。
-func buildWant(domains []string, ip string) map[string]map[string]bool {
+func buildWant(domains []string, ips []string) map[string]map[string]bool {
 	want := make(map[string]map[string]bool, len(domains)*2)
 	for _, d := range domains {
-		want[d] = map[string]bool{ip: true}
+		set := make(map[string]bool, len(ips))
+		for _, ip := range ips {
+			if ip != "" {
+				set[ip] = true
+			}
+		}
+		want[d] = set
 		if strings.HasPrefix(d, "*.") {
-			want[strings.TrimPrefix(d, "*.")] = map[string]bool{ip: true}
+			bare := make(map[string]bool, len(set))
+			for ip := range set {
+				bare[ip] = true
+			}
+			want[strings.TrimPrefix(d, "*.")] = bare
 		} else {
 			want["*."+d] = map[string]bool{}
 		}
@@ -819,11 +824,36 @@ func buildWant(domains []string, ip string) map[string]map[string]bool {
 	return want
 }
 
-// wantForInstance 构造指定实例的期望重写集合：最优 IP 重写（含另一形式清理）+ 该实例独有的手动重写规则。
-func wantForInstance(domains []string, ip string, inst config.AdguardInstance) map[string]map[string]bool {
+// answersForInstance 按实例类型计算应写入的答案序列（双栈优选的核心分流）：
+//   - 文件型（dnsmasq/SmartDNS/MosDNS）：hosts/conf-file 同域名可并存多条记录，
+//     双栈时同时写入 IPv4 + IPv6 各自的优选 IP（A + AAAA 并存，客户端按自身能力选择）；
+//   - API 型（AdGuard rewrite / Technitium A 记录）：同域名仅支持单条，
+//     固定写 IPv4 优选；无 IPv4 结果（纯 v6 网络）时退化为 IPv6。
+func answersForInstance(inst config.AdguardInstance, ip4, ip6 string) []string {
+	if isFileBasedType(inst.Type) {
+		out := make([]string, 0, 2)
+		if ip4 != "" {
+			out = append(out, ip4)
+		}
+		if ip6 != "" {
+			out = append(out, ip6)
+		}
+		return out
+	}
+	if ip4 != "" {
+		return []string{ip4}
+	}
+	if ip6 != "" {
+		return []string{ip6}
+	}
+	return nil
+}
+
+// wantForInstance 构造指定实例的期望重写集合：按实例类型分流的答案集（含另一形式清理）+ 该实例独有的手动重写规则。
+func wantForInstance(domains []string, ips []string, inst config.AdguardInstance) map[string]map[string]bool {
 	var want map[string]map[string]bool
-	if ip != "" && len(domains) > 0 {
-		want = buildWant(domains, ip)
+	if len(ips) > 0 && len(domains) > 0 {
+		want = buildWant(domains, ips)
 	} else {
 		want = map[string]map[string]bool{}
 	}
@@ -839,32 +869,59 @@ func wantForInstance(domains []string, ip string, inst config.AdguardInstance) m
 	return want
 }
 
-// writeCurrentBestToInstance 把当前生效的最优 IP 立即写入指定实例的全部
-// 目标域名；无历史结果时静默跳过（等下轮测速）。
-func (s *Server) writeCurrentBestToInstance(inst config.AdguardInstance) {
+// laneIPs 返回 IPv4 / IPv6 两个地址族当前的生效 IP（双栈写入的统一取值口径）：
+// 守护协程接管值优先 → 该族测速最优 → 持久化的最近结果。
+// test_ipv6 关闭时 IPv6 车道恒为空。
+func (s *Server) laneIPs() (ip4, ip6 string) {
 	s.mu.Lock()
-	active := s.activeIP
+	a4, a6 := s.activeIP, s.activeIP6
 	results := append([]speedtest.Result(nil), s.status.Results...)
-	domains := s.expandDomains(s.cfg.CustomDomains, s.cfg.DomainMetas)
-	lastIP := s.cfg.LastResultIP
+	l4, l6 := s.cfg.LastResultIP, s.cfg.LastResultIP6
 	s.mu.Unlock()
 
-	ip := active
-	if ip == "" && len(results) > 0 {
-		ip = results[0].IP // 尚未由守护协程接管时退化为测速最优
+	ip4 = a4
+	if ip4 == "" {
+		if r, ok := speedtest.BestOfFamily(results, false); ok {
+			ip4 = r.IP
+		}
 	}
-	if ip == "" {
-		ip = lastIP // 重启后无内存结果时回退持久化的最近结果
+	if ip4 == "" {
+		ip4 = l4
 	}
+	// IPv6 车道不回退到 LastResultIP：整体最优可能是 v4，混入会污染 v6 车道
+	ip6 = a6
+	if ip6 == "" {
+		if r, ok := speedtest.BestOfFamily(results, true); ok {
+			ip6 = r.IP
+		}
+	}
+	if ip6 == "" {
+		ip6 = l6
+	}
+	return
+}
+
+// writeCurrentBestToInstance 把当前生效的双栈优选 IP 立即写入指定实例的全部
+// 目标域名；无任何历史结果时静默跳过（等下轮测速）。
+func (s *Server) writeCurrentBestToInstance(inst config.AdguardInstance) {
+	s.mu.Lock()
+	domains := s.expandDomains(s.cfg.CustomDomains, s.cfg.DomainMetas)
+	s.mu.Unlock()
+
+	ip4, ip6 := s.laneIPs()
+	if ip4 == "" && ip6 == "" {
+		return
+	}
+	answers := answersForInstance(inst, ip4, ip6)
 	// 接管语义：无论 want 是否为空都执行整表重发（空表 = 清空实例现有规则）
 	client := s.providerFor(inst)
-	_, err := client.ReplaceRewrites(wantForInstance(domains, ip, inst))
+	_, err := client.ReplaceRewrites(wantForInstance(domains, answers, inst))
 	if err != nil {
 		log.Printf("[错误] [%s] 初始化写入失败: %v", inst.Name, err)
 		return
 	}
-	fmt.Printf("[%s] 新实例 %s 初始化写入完成：%s → %d 个域名\n",
-		time.Now().Format("2006-01-02 15:04:05"), inst.Name, ip, len(domains))
+	fmt.Printf("[%s] 新实例 %s 初始化写入完成：%s / %s → %d 个域名\n",
+		time.Now().Format("2006-01-02 15:04:05"), inst.Name, ip4, ip6, len(domains))
 }
 
 // providerFor 构造指定实例的 DNS Provider；未知类型回退 AdGuard（兼容旧配置）。
@@ -885,24 +942,15 @@ func (s *Server) instances() []config.AdguardInstance {
 }
 
 // expectedRewritesFor 计算指定实例期望的完整重写集合：
-// 每个目标域名 → 当前生效的最优 IP（单条）+ 该实例独有的手动规则。
+// 每个目标域名 → 按实例类型分流的答案集（文件型双栈为 v4+v6 两条）+ 该实例独有的手动规则。
 // 第二个返回值 false 表示该实例没有任何可写内容。
 func (s *Server) expectedRewritesFor(inst config.AdguardInstance) (map[string]map[string]bool, bool) {
 	s.mu.Lock()
-	active := s.activeIP
-	results := append([]speedtest.Result(nil), s.status.Results...)
 	domains := s.expandDomains(s.cfg.CustomDomains, s.cfg.DomainMetas)
-	lastIP := s.cfg.LastResultIP
 	s.mu.Unlock()
 
-	ip := active
-	if ip == "" && len(results) > 0 {
-		ip = results[0].IP // 尚未由守护协程接管时退化为测速最优
-	}
-	if ip == "" {
-		ip = lastIP // 重启后无内存结果时回退持久化的最近结果
-	}
-	want := wantForInstance(domains, ip, inst)
+	ip4, ip6 := s.laneIPs()
+	want := wantForInstance(domains, answersForInstance(inst, ip4, ip6), inst)
 	if len(want) == 0 {
 		return nil, false
 	}
@@ -1306,20 +1354,11 @@ func (s *Server) manualRewritesOf(url string) []config.ManualRewrite {
 func (s *Server) syncInstanceBackground(inst config.AdguardInstance) {
 	go func() {
 		s.mu.Lock()
-		active := s.activeIP
-		results := append([]speedtest.Result(nil), s.status.Results...)
 		domains := s.expandDomains(s.cfg.CustomDomains, s.cfg.DomainMetas)
-		lastIP := s.cfg.LastResultIP
 		s.mu.Unlock()
-		ip := active
-		if ip == "" && len(results) > 0 {
-			ip = results[0].IP
-		}
-		if ip == "" {
-			ip = lastIP // 重启后无内存结果时回退持久化的最近结果
-		}
+		ip4, ip6 := s.laneIPs()
 		client := s.providerFor(inst)
-		if _, err := client.ReplaceRewrites(wantForInstance(domains, ip, inst)); err != nil {
+		if _, err := client.ReplaceRewrites(wantForInstance(domains, answersForInstance(inst, ip4, ip6), inst)); err != nil {
 			log.Printf("[错误] [%s] 手动规则同步失败: %v", inst.Name, err)
 		} else {
 			fmt.Printf("[%s] [%s] 重写表已同步（含手动规则）\n", time.Now().Format("2006-01-02 15:04:05"), inst.Name)
@@ -1439,17 +1478,28 @@ func (s *Server) runOnce(trigger string) {
 	}
 
 	st.Results = allResults
-	best, ok := speedtest.Best(allResults)
-	if !ok {
+	// 双栈优选：IPv4 / IPv6 各自取该地址族排名最高者（结果列表仍合并排序供展示）。
+	// test_ipv6 关闭时 allResults 即纯 IPv4 结果，行为与旧版完全一致。
+	best4, ok4 := speedtest.Best(results) // results = IPv4 轮结果
+	best6, hasV6 := speedtest.BestOfFamily(allResults, true)
+	if !ok4 && !hasV6 {
 		st.LastError = "没有可用结果"
 		record.Error = "没有可用结果"
 		finish()
 		return
 	}
-	st.BestIP = best.IP
-	st.BestDelayMs = best.DelayMs
-	st.BestSpeedMBps = best.SpeedMBps
-	st.BestColo = best.Colo
+	// 整体最优仍按合并排名取第一（作为 BestIP 的回退语义：IPv4 无结果时展示 IPv6 最优）
+	if !ok4 && hasV6 {
+		best4 = best6
+	}
+	st.BestIP = best4.IP
+	st.BestDelayMs = best4.DelayMs
+	st.BestSpeedMBps = best4.SpeedMBps
+	st.BestColo = best4.Colo
+	if hasV6 {
+		st.BestIP6 = best6.IP
+		st.BestIP6DelayMs = best6.DelayMs
+	}
 	// 只保留 Top N 结果：test_all 时全量结果可达数万条，
 	// 全量驻留内存并随每次状态轮询序列化返回既浪费内存也浪费带宽。
 	if len(allResults) > maxStatusResults {
@@ -1460,15 +1510,21 @@ func (s *Server) runOnce(trigger string) {
 	// 组装要写入重写的域名列表（按「包含子域」元数据展开为实际写入形式）
 	domains := s.expandDomains(cfg.CustomDomains, cfg.DomainMetas)
 
-	// 写入策略：每个域名只写最快的 1 个 IP。
-	// AdGuard Home 的 rewrite 规则不支持同域名多条记录，多 IP 写入无意义；
-	// 备援由可达性守护协程负责（当前 IP 不可达时轮换到上次测速的 #2/#3...）。
-	bestIP := best.IP
+	// 写入策略（双栈优选）：
+	//   文件型实例（dnsmasq/SmartDNS/MosDNS）的规则文件同域名可并存多条记录，
+	//     同时写入 IPv4 + IPv6 各自的优选 IP（A + AAAA）；
+	//   API 型实例（AdGuard rewrite / Technitium A 记录）同域名仅支持单条，
+	//     固定写 IPv4 优选（无 IPv4 结果时退化 IPv6）；
+	//   备援由可达性守护协程分车道负责（各地址族独立轮换备选）。
+	ip4Lane := best4.IP // ok4 为假时已退化为 best6（纯 v6 网络）
+	ip6Lane := ""
+	if hasV6 {
+		ip6Lane = best6.IP
+	}
 
-	// 写入全部 AdGuard Home 实例（互为备份）。
-	// 每个实例的期望集合 = 最优 IP 重写 + 该实例独有手动规则，整表下发。
-	fmt.Printf("[%s] 最快 IP: %s，开始写入 %d 个 AdGuard Home 实例 × %d 个域名...\n",
-		now, bestIP, len(cfg.AdguardInstances), len(domains))
+	// 写入全部实例（互为备份）。每个实例的期望集合 = 按类型分流的答案 + 该实例独有手动规则，整表下发。
+	fmt.Printf("[%s] 最快 IPv4: %s，最快 IPv6: %s，开始写入 %d 个实例 × %d 个域名...\n",
+		now, ip4Lane, ip6Lane, len(cfg.AdguardInstances), len(domains))
 
 	// 写入阶段进度上报（按实例推进）
 	writeTotal := len(cfg.AdguardInstances)
@@ -1479,7 +1535,7 @@ func (s *Server) runOnce(trigger string) {
 		onProgress(speedtest.Progress{Phase: "writing", PhaseLabel: "写入 AdGuard 重写规则",
 			Current: writeDone, Total: writeTotal, Detail: fmt.Sprintf("实例 %s", inst.Name)})
 		client := s.providerFor(inst)
-		stats, err := client.ReplaceRewrites(wantForInstance(domains, bestIP, inst))
+		stats, err := client.ReplaceRewrites(wantForInstance(domains, answersForInstance(inst, ip4Lane, ip6Lane), inst))
 		if err != nil {
 			fmt.Printf("[%s] [%s] 写入重写失败: %v\n", now, inst.Name, err)
 			st.WrittenDomains = append(st.WrittenDomains, WrittenDomain{
@@ -1503,10 +1559,11 @@ func (s *Server) runOnce(trigger string) {
 	onProgress(speedtest.Progress{Phase: "writing", PhaseLabel: "写入 AdGuard 重写规则", Current: writeTotal, Total: writeTotal})
 
 	record.OK = true
-	record.BestIP = best.IP
-	record.DelayMs = best.DelayMs
-	record.SpeedMBps = best.SpeedMBps
-	record.Colo = best.Colo
+	record.BestIP = best4.IP
+	record.BestIP6 = ip6Lane
+	record.DelayMs = best4.DelayMs
+	record.SpeedMBps = best4.SpeedMBps
+	record.Colo = best4.Colo
 	record.Written = len(st.WrittenDomains)
 	// 保存该次任务的 Top 20 结果，供任务详情弹窗展示
 	if len(st.Results) > 20 {
@@ -1519,9 +1576,11 @@ func (s *Server) runOnce(trigger string) {
 	// 注意：finish() 内部会加 s.mu，此处不能在持锁状态下调用（互斥锁不可重入），
 	// 否则自死锁导致全部 API 卡死。改为先更新共享状态、解锁后再 finish()。
 	s.mu.Lock()
-	s.cfg.LastResultIP = best.IP
+	s.cfg.LastResultIP = ip4Lane
+	s.cfg.LastResultIP6 = ip6Lane
 	s.cfg.LastResultTime = now
-	s.activeIP = best.IP
+	s.activeIP = ip4Lane
+	s.activeIP6 = ip6Lane
 	s.failStreak = 0
 	s.backoffUntil = time.Time{}
 	saveErr := s.cfg.Save()
@@ -1531,8 +1590,8 @@ func (s *Server) runOnce(trigger string) {
 		log.Printf("[错误] 配置保存失败: %v", saveErr)
 	}
 
-	fmt.Printf("[%s] 测速完成，最快 IP: %s (延迟 %.1fms, 速度 %.2f MB/s)，共写入 %d 条\n",
-		now, best.IP, best.DelayMs, best.SpeedMBps, len(st.WrittenDomains))
+	fmt.Printf("[%s] 测速完成，最快 IPv4: %s (延迟 %.1fms, 速度 %.2f MB/s)，最快 IPv6: %s，共写入 %d 条\n",
+		now, ip4Lane, best4.DelayMs, best4.SpeedMBps, ip6Lane, len(st.WrittenDomains))
 }
 
 // RunOnceAndWait 执行一次测速并写入后返回（供 -once 模式 / cron 使用）。
@@ -1576,23 +1635,27 @@ func (s *Server) probeAlive(ip string) bool {
 	return true
 }
 
-// candidateIPs 返回上次测速结果中的候选 IP 序列（按排名，最多取前 5 个）。
-func (s *Server) candidateIPs() []string {
+// candidateIPs 返回上次测速结果中指定地址族的候选 IP 序列（按排名，最多取前 5 个）。
+func (s *Server) candidateIPs(v6 bool) []string {
 	s.mu.Lock()
 	results := append([]speedtest.Result(nil), s.status.Results...)
 	s.mu.Unlock()
 	ips := make([]string, 0, 5)
 	for _, r := range results {
+		if speedtest.IsIPv6(r.IP) != v6 {
+			continue
+		}
+		ips = append(ips, r.IP)
 		if len(ips) >= 5 {
 			break
 		}
-		ips = append(ips, r.IP)
 	}
 	return ips
 }
 
-// writeIPToInstances 把指定 IP 写入全部实例的全部管理域名（守护协程轮换用）。
-func (s *Server) writeIPToInstances(ip string) bool {
+// writeLanesToInstances 把双栈车道的当前生效 IP 写入全部实例的全部管理域名（守护协程轮换用）：
+// 文件型实例写入 v4+v6 两条，API 型实例按 v4 优先写入单条。
+func (s *Server) writeLanesToInstances(ip4, ip6 string) bool {
 	domains := s.managedDomains()
 	if len(domains) == 0 {
 		return true // 无域名可写，视为成功
@@ -1600,8 +1663,8 @@ func (s *Server) writeIPToInstances(ip string) bool {
 	okAll := true
 	for _, inst := range s.instances() {
 		client := s.providerFor(inst)
-		if _, err := client.ReplaceRewrites(wantForInstance(domains, ip, inst)); err != nil {
-			log.Printf("[错误] [守护] [%s] 轮换写入 %s 失败: %v", inst.Name, ip, err)
+		if _, err := client.ReplaceRewrites(wantForInstance(domains, answersForInstance(inst, ip4, ip6), inst)); err != nil {
+			log.Printf("[错误] [守护] [%s] 轮换写入失败 (%s / %s): %v", inst.Name, ip4, ip6, err)
 			okAll = false
 		}
 	}
@@ -1680,53 +1743,95 @@ func (s *Server) StopWatchdog() {
 }
 
 // watchdogOnce 执行一轮探测与故障处理。所有分支都保证不阻塞超过数秒。
+// 双栈分车道：IPv4 / IPv6 各自独立维护生效 IP 与备选序列，互不影响；
+// 某车道无候选（未启用 IPv6 或该族无结果）时该车道跳过。
 func (s *Server) watchdogOnce() {
 	// 退避期内不动作
 	s.mu.Lock()
 	inBackoff := time.Now().Before(s.backoffUntil)
-	active := s.activeIP
 	running := s.running
 	s.mu.Unlock()
 	if inBackoff || running {
 		return
 	}
-	if active == "" {
-		// 尚无生效 IP：若已有测速结果则接管最优，否则等首次测速完成
-		ips := s.candidateIPs()
-		if len(ips) == 0 {
-			return
-		}
+
+	getActive := func(v6 bool) string {
 		s.mu.Lock()
-		s.activeIP = ips[0]
-		s.mu.Unlock()
-		active = ips[0]
-		fmt.Printf("[守护] 接管当前最优 IP: %s\n", active)
-	}
-
-	if s.probeAlive(active) {
-		return // 一切正常
-	}
-	fmt.Printf("[守护] 当前生效 IP %s 不可达，尝试轮换备选...\n", active)
-
-	// 依次尝试上次测速的 #2~#5（跳过当前已失效的 active）
-	for _, cand := range s.candidateIPs() {
-		if cand == active {
-			continue
+		defer s.mu.Unlock()
+		if v6 {
+			return s.activeIP6
 		}
-		if s.probeAlive(cand) {
-			fmt.Printf("[守护] 轮换到备选 IP: %s\n", cand)
-			if s.writeIPToInstances(cand) {
-				s.mu.Lock()
-				s.activeIP = cand
-				s.failStreak = 0
-				s.backoffUntil = time.Time{}
-				s.mu.Unlock()
+		return s.activeIP
+	}
+	setActive := func(v6 bool, ip string) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if v6 {
+			s.activeIP6 = ip
+		} else {
+			s.activeIP = ip
+		}
+	}
+
+	type lane struct {
+		label string
+		v6    bool
+	}
+	failedLanes := 0
+	for _, ln := range []lane{{"IPv4", false}, {"IPv6", true}} {
+		cands := s.candidateIPs(ln.v6)
+		if len(cands) == 0 {
+			continue // 该地址族未启用或无结果，车道跳过
+		}
+		active := getActive(ln.v6)
+		if active == "" {
+			// 尚无生效 IP：接管该族测速最优
+			setActive(ln.v6, cands[0])
+			active = cands[0]
+			fmt.Printf("[守护] 接管当前最优 %s IP: %s\n", ln.label, active)
+		}
+
+		if s.probeAlive(active) {
+			continue // 该车道一切正常
+		}
+		fmt.Printf("[守护] 当前生效 %s IP %s 不可达，尝试轮换备选...\n", ln.label, active)
+
+		// 依次尝试该族上次测速的 #2~#5（跳过当前已失效的 active）
+		rotated := ""
+		for _, cand := range cands {
+			if cand == active {
+				continue
 			}
-			return
+			if s.probeAlive(cand) {
+				rotated = cand
+				break
+			}
+		}
+		if rotated == "" {
+			failedLanes++
+			continue // 该族前 5 名均不可达 → 统一计入失败并触发重测
+		}
+		fmt.Printf("[守护] 轮换到 %s 备选 IP: %s\n", ln.label, rotated)
+		// 另一族保持当前生效值一并写入（文件型保持双栈，API 型按 v4 优先取单条）
+		ip4, ip6 := getActive(false), getActive(true)
+		if ln.v6 {
+			ip6 = rotated
+		} else {
+			ip4 = rotated
+		}
+		if s.writeLanesToInstances(ip4, ip6) {
+			setActive(ln.v6, rotated)
+			s.mu.Lock()
+			s.failStreak = 0
+			s.backoffUntil = time.Time{}
+			s.mu.Unlock()
 		}
 	}
+	if failedLanes == 0 {
+		return
+	}
 
-	// 前 5 名全部不可达：触发重新测速（指数退避）
+	// 全部活动车道的前 5 名均不可达：触发重新测速（指数退避）
 	s.mu.Lock()
 	s.failStreak++
 	backoff := time.Duration(1<<uint(s.failStreak-1)) * time.Minute // 1,2,4,... 封顶 60 分钟

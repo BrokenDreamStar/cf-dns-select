@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/neon9809/cf-dns-select/config"
@@ -162,4 +163,46 @@ func osStat(path string) (interface{ Name() string }, error) {
 func mustJSON(v any) string {
 	b, _ := json.Marshal(v)
 	return string(b)
+}
+
+// 文件型 provider：双栈答案（同域名 v4+v6 两条记录）渲染与回读。
+func TestFileBasedDualStack(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rules.conf")
+	c := NewFileBased(config.AdguardInstance{RulesFile: path}, "smartdns", fileFormatSmartDNS)
+	if err := c.TestConnection(); err != nil {
+		t.Fatal(err)
+	}
+	stats, err := c.ReplaceRewrites(map[string]map[string]bool{
+		"a.example.com": {"104.20.50.16": true, "2606:4700::6810": true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Written != 2 {
+		t.Errorf("双栈应写入 2 条，实际 %d", stats.Written)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 渲染按域名排序，同域名内按答案字符串排序：2606:… < 104.20.50.16 不成立（'1'<'2'），
+	// 实际顺序为 104.20.50.16 在前
+	want := "address /a.example.com/104.20.50.16\naddress /a.example.com/2606:4700::6810\n"
+	if !strings.HasSuffix(string(data), want) {
+		t.Errorf("受管文件应包含 v4+v6 两条 address 记录，实际尾部:\n%s", data)
+	}
+	list, err := c.ListRewrites()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 2 {
+		t.Fatalf("回读应得 2 条，实际 %d: %+v", len(list), list)
+	}
+	fams := map[string]bool{}
+	for _, e := range list {
+		fams[e.Answer] = true
+	}
+	if !fams["104.20.50.16"] || !fams["2606:4700::6810"] {
+		t.Errorf("回读应同时含 v4 与 v6 答案: %+v", list)
+	}
 }

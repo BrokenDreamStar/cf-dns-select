@@ -76,7 +76,8 @@ type Config struct {
 	TestIPv6 bool `json:"test_ipv6"` // IPv6 是否参与测速与最优排名（与 IPv4 合并取最快；唯一开关）
 
 	// 运行状态（持久化便于重启后回显）
-	LastResultIP   string `json:"last_result_ip,omitempty"`
+	LastResultIP   string `json:"last_result_ip,omitempty"`  // IPv4 地址族优选结果（双栈关闭时即整体最优）
+	LastResultIP6  string `json:"last_result_ip6,omitempty"` // IPv6 地址族优选结果（仅 test_ipv6 开启时写入）
 	LastResultTime string `json:"last_result_time,omitempty"`
 }
 
@@ -350,6 +351,7 @@ func (c *Config) applyUpdate(in Config, present map[string]bool) {
 	}
 	// 运行状态字段由内部管理，不接受外部提交，始终保留
 	c.LastResultIP = old.LastResultIP
+	c.LastResultIP6 = old.LastResultIP6
 	c.LastResultTime = old.LastResultTime
 }
 

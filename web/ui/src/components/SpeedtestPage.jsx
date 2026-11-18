@@ -96,7 +96,12 @@ export default function SpeedtestPage() {
               <tr className="clickable" key={i} onClick={() => setRunModalIdx(i)}>
                 <td>{r.time}</td>
                 <td><span className="badge">{TRIGGER_NAMES[r.trigger] || r.trigger}</span></td>
-                <td className="mono">{r.best_ip || '—'}</td>
+                <td className="mono">
+                  {r.best_ip || '—'}
+                  {r.best_ip6 && (
+                    <div style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>{r.best_ip6}</div>
+                  )}
+                </td>
                 <td>{r.delay_ms ? r.delay_ms.toFixed(1) + ' ms' : '—'}</td>
                 <td>{r.speed_mbps ? r.speed_mbps.toFixed(2) : '—'}</td>
                 <td>{r.written || 0} 条</td>
@@ -141,8 +146,11 @@ export default function SpeedtestPage() {
       </div>
 
       <div className="card">
-        <h2>IPv6 测速</h2>
-        <div className="card-sub">是否使用 Cloudflare IPv6 节点</div>
+        <h2>IPv6 测速（双栈优选）</h2>
+        <div className="card-sub">
+          启用后 IPv4 / IPv6 各自优选：文件型实例（dnsmasq/SmartDNS/MosDNS）同域名写入 A + AAAA 双记录；
+          API 型实例（AdGuard/Technitium）同域名仅支持单条，固定写 IPv4 优选
+        </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
           <label className="switch">
             <input type="checkbox" checked={cfg.test_ipv6 !== false} onChange={onToggle('test_ipv6')} />
@@ -152,6 +160,7 @@ export default function SpeedtestPage() {
             启用 IPv6<small style={{ color: 'var(--text-tertiary)', marginLeft: 8 }}>请确认网络环境是否支持 IPv6</small>
           </span>
         </div>
+        <div className="hint">守护协程会分车道独立探测两个地址族并各自轮换备选；某地址族无可用结果时自动只写另一族。</div>
       </div>
 
       <div className="card">
@@ -209,8 +218,9 @@ export default function SpeedtestPage() {
             <div className="modal-sub">
               {(TRIGGER_NAMES[h.trigger] || h.trigger) + '触发 · ' +
                 (h.ok
-                  ? ('最快 ' + (h.best_ip || '—') + ' · ' + (h.delay_ms ? h.delay_ms.toFixed(1) + ' ms' : '—') +
+                  ? ('最快 IPv4 ' + (h.best_ip || '—') + ' · ' + (h.delay_ms ? h.delay_ms.toFixed(1) + ' ms' : '—') +
                     ' · ' + (h.speed_mbps ? h.speed_mbps.toFixed(2) + ' MB/s' : '—') + (h.colo ? ' · ' + h.colo : '') +
+                    (h.best_ip6 ? ' · 最快 IPv6 ' + h.best_ip6 : '') +
                     ' · 写入 ' + (h.written || 0) + ' 条 · 耗时 ' + (h.duration_s ? h.duration_s.toFixed(0) + 's' : '—'))
                   : ('失败：' + (h.error || '未知错误')))}
             </div>
