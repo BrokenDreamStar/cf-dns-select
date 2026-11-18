@@ -11,7 +11,7 @@ name: cf-dns-select
 services:
   cf-dns-select:
     profiles: ["host"]
-    image: ghcr.io/neon9809/cf-dns-select:0.3.4
+    image: ghcr.io/brokendreamstar/cf-dns-select:0.3.5
     container_name: cf-dns-select
     restart: unless-stopped
     # host 模式：直接继承宿主网络栈（IPv4/IPv6 测速需要），
@@ -34,7 +34,7 @@ services:
 
   cf-dns-select-bridge:
     profiles: ["bridge"]
-    image: ghcr.io/neon9809/cf-dns-select:0.3.4
+    image: ghcr.io/brokendreamstar/cf-dns-select:0.3.5
     container_name: cf-dns-select
     restart: unless-stopped
     # bridge 模式：端口映射访问；受 NAT 限制，IPv6 测速不可用。

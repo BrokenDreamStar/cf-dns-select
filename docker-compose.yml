@@ -1,6 +1,6 @@
 services:
   cf-dns-select:
-    image: ghcr.io/neon9809/cf-dns-select:latest   # 官方多架构镜像（amd64/arm64）
+    image: ghcr.io/brokendreamstar/cf-dns-select:latest   # 本 fork 构建的多架构镜像（amd64/arm64）
     container_name: cf-dns-select
     restart: unless-stopped
 

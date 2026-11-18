@@ -4,20 +4,20 @@
 （Cloudflare 最优节点自动测速 + 多实例 AdGuard Home DNS 重写，内置 Web Dashboard）
 以 **Docker 应用**形态打包为飞牛 fnOS 的 `.fpk` 安装包。
 
-**版本约定**：包版本与上游应用版本保持一致（当前 `0.3.4`），
-compose 镜像固定为 `ghcr.io/neon9809/cf-dns-select:0.3.4`，不使用 latest——
+**版本约定**：包版本与上游应用版本保持一致（当前 `0.3.5`），
+compose 镜像固定为 `ghcr.io/brokendreamstar/cf-dns-select:0.3.5`，不使用 latest——
 保证同一个 .fpk 在任何时间安装出的内容完全一致，可复现、可回滚。
 
 ## 目录结构
 
 ```
 cf-dns-select-fpk/
-├── manifest                        # 应用元数据（appname/version=0.3.4/platform=all/os_min_version=1.1.8）
+├── manifest                        # 应用元数据（appname/version=0.3.5/platform=all/os_min_version=1.1.8）
 ├── SUBMISSION.md                   # 提交审核说明（host 网络论证 / 暴露面 / 访问控制）
 ├── ICON.PNG / ICON_256.PNG         # 包图标 64/256
 ├── app/
 │   ├── docker/
-│   │   ├── docker-compose.yaml     # 镜像固定 tag：ghcr.io/neon9809/cf-dns-select:0.3.4
+│   │   ├── docker-compose.yaml     # 镜像固定 tag：ghcr.io/brokendreamstar/cf-dns-select:0.3.5
 │   │   ├── .env                    # COMPOSE_PROFILES 默认值（随包携带，决定网络模式）
 │   │   └── env/app.env             # 运行参数默认值（随包携带，安装后必然存在）
 │   └── ui/
@@ -39,8 +39,8 @@ cf-dns-select-fpk/
 
 ## 关键设计
 
-- **镜像固定版本**：两个 service 都引用 `ghcr.io/neon9809/cf-dns-select:0.3.4`
-  （ghcr 上同时存在 `0.3.4` 与 `v0.3.4` 标签）。升级 = 发布新 .fpk（新 tag 新镜像），
+- **镜像固定版本**：两个 service 都引用 `ghcr.io/brokendreamstar/cf-dns-select:0.3.5`
+  （ghcr 上同时存在 `0.3.5` 与 `v0.3.5` 标签）。升级 = 发布新 .fpk（新 tag 新镜像），
   不追上游 floating tag。
 - **网络模式可选**：安装向导「网络模式」页二选一：
   - **host**（默认/推荐）：容器直接使用宿主网络栈，真实 IPv4+IPv6 测速环境；
@@ -110,10 +110,10 @@ cd cf-dns-select-fpk && fnpack build
 
 1. 把整个工作区（`fpk-sandbox/`、`cf-dns-select-fpk/`、`.github/`）推到一个 GitHub 仓库；
 2. 发版时保证 manifest.version、compose 镜像标签、git 标签三者一致
-   （如 `0.3.4` / `:0.3.4` / `v0.3.4`），然后：
+   （如 `0.3.5` / `:0.3.5` / `v0.3.5`），然后：
 
    ```bash
-   git tag v0.3.4 && git push origin v0.3.4
+   git tag v0.3.5 && git push origin v0.3.5
    ```
 
 3. Actions 构建完成后，`cf-dns-select.fpk` 与 `SHA256SUMS.txt` 会出现在同名 Release 下；
