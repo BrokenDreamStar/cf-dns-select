@@ -116,7 +116,9 @@ jobs:
         run: |
           set -e
           TAG="${GITHUB_REF_NAME#v}"
-          docker buildx imagetools inspect "${REGISTRY}/${IMAGE_NAME}:${TAG}" >/dev/null
+          # GHCR 镜像路径必须全小写；github.repository 保留原始大小写，
+          # 仓库主名含大写字母时（如 BrokenDreamStar/...）inspect 会 404
+          docker buildx imagetools inspect "${REGISTRY}/${IMAGE_NAME,,}:${TAG}" >/dev/null
 
       - name: 版本一致性检查（tag = manifest = compose image tags）
         if: startsWith(github.ref, 'refs/tags/')
