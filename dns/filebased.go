@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -55,10 +56,7 @@ func (c *fileClient) TestConnection() error {
 	if c.rulesFile == "" {
 		return fmt.Errorf("未配置受管规则文件路径（rules_file）")
 	}
-	dir := c.rulesFile[:strings.LastIndex(c.rulesFile, "/")]
-	if dir == "" {
-		dir = "."
-	}
+	dir := filepath.Dir(c.rulesFile)
 	fi, err := os.Stat(dir)
 	if err != nil {
 		return fmt.Errorf("规则目录不可访问 %q: %w", dir, err)

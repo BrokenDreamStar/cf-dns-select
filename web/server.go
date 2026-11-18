@@ -651,10 +651,25 @@ func (s *Server) handleInstances(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		in.Name = strings.TrimSpace(in.Name)
-		in.URL = normalizeInstanceURL(in.URL)
-		if in.URL == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "缺少 url 字段"})
-			return
+		in.RulesFile = strings.TrimSpace(in.RulesFile)
+		// 文件型实例（dnsmasq/smartdns/mosdns）没有 API 地址，URL 按设计留空；
+		// 但查重/删除/定位均以 URL 为键，故用受管规则文件路径合成 file:// 标识充当主键。
+		if isFileBasedType(in.Type) {
+			if in.RulesFile == "" {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "缺少受管规则文件路径（rules_file）"})
+				return
+			}
+			if !strings.HasPrefix(in.RulesFile, "/") {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "受管规则文件路径必须为容器内绝对路径"})
+				return
+			}
+			in.URL = "file://" + in.RulesFile
+		} else {
+			in.URL = normalizeInstanceURL(in.URL)
+			if in.URL == "" {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "缺少 url 字段"})
+				return
+			}
 		}
 		if in.Name == "" {
 			in.Name = fmt.Sprintf("实例-%d", len(s.cfg.AdguardInstances)+1)
@@ -1069,6 +1084,16 @@ func (s *Server) runSync(targets []config.AdguardInstance) []syncResult {
 	}
 	wg.Wait()
 	return results
+}
+
+// isFileBasedType 文件型实例类型判定（无在线管理 API，经受管规则文件写入）。
+func isFileBasedType(t string) bool {
+	switch t {
+	case "dnsmasq", "smartdns", "mosdns":
+		return true
+	default:
+		return false
+	}
 }
 
 // normalizeInstanceURL 规范化实例地址：trim + 去尾部斜杠；

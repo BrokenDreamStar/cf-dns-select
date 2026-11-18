@@ -94,7 +94,10 @@ export default function InstancesPage() {
       reload_cmd: form.reload_cmd,
       adopt,
     };
-    if (!body.url) { toast('请填写实例地址', true); return; }
+    // API 型校验实例地址；文件型无地址字段，校验受管规则文件路径（URL 由后端按文件路径合成）
+    const isAPI = PROVIDER_TYPES.find(t => t.value === form.type)?.api;
+    if (isAPI && !body.url) { toast('请填写实例地址', true); return; }
+    if (!isAPI && !body.rules_file) { toast('请填写受管规则文件路径', true); return; }
     try {
       const resp = await fetch('/api/instances', {
         method: 'POST',

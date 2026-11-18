@@ -380,3 +380,64 @@ func TestWildcardToggleCreatesMeta(t *testing.T) {
 		t.Errorf("应自动创建 openrouter.ai 的元数据并置 wildcard=true，实际 %+v", s.cfg.DomainMetas)
 	}
 }
+
+// Issue #2 回归：文件型实例（dnsmasq/SmartDNS/MosDNS）没有实例地址，
+// 添加时不应要求 url；后端用受管规则文件路径合成 file:// 标识充当主键
+// （查重/删除/定位均按 URL 匹配）。
+func TestAddFileBasedInstance(t *testing.T) {
+	t.Setenv("DSA_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	s, err := New(newTestConfig(), "password123", mustParseCIDRs(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tok, err := s.sessions.newSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	post := func(body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/api/instances", strings.NewReader(body))
+		req.RemoteAddr = "127.0.0.1:12345"
+		req.Header.Set("Authorization", "Bearer "+tok)
+		rr := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rr, req)
+		return rr
+	}
+
+	rulesFile := filepath.Join(t.TempDir(), "cf-dns-select.hosts")
+	rr := post(fmt.Sprintf(`{"name":"smartdns","type":"smartdns","url":"","rules_file":%q}`, rulesFile))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("添加文件型实例（空 url）应成功，status %d: %s", rr.Code, rr.Body.String())
+	}
+	if len(s.cfg.AdguardInstances) != 1 {
+		t.Fatalf("实例未入库: %d", len(s.cfg.AdguardInstances))
+	}
+	inst := s.cfg.AdguardInstances[0]
+	if inst.URL != "file://"+rulesFile {
+		t.Errorf("文件型实例主键应为合成的 file:// 标识，got %q", inst.URL)
+	}
+	if inst.Type != "smartdns" || inst.RulesFile != rulesFile {
+		t.Errorf("type/rules_file 未按提交持久化: %+v", inst)
+	}
+
+	// 相同规则文件路径重复添加 → 查重拒绝（该路径下受管文件仅为注释头，不会触发接管协商）
+	if rr := post(fmt.Sprintf(`{"type":"smartdns","rules_file":%q}`, rulesFile)); rr.Code != http.StatusConflict {
+		t.Errorf("相同文件路径重复添加应 409，got %d: %s", rr.Code, rr.Body.String())
+	}
+	// 不同路径的文件型实例可正常添加（此前会被「缺少 url 字段」拦截）
+	other := filepath.Join(t.TempDir(), "other.hosts")
+	if rr := post(fmt.Sprintf(`{"type":"dnsmasq","rules_file":%q}`, other)); rr.Code != http.StatusOK {
+		t.Errorf("不同文件路径的文件型实例应可添加，got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	// 缺少 rules_file / 相对路径 → 400
+	if rr := post(`{"type":"smartdns"}`); rr.Code != http.StatusBadRequest {
+		t.Errorf("缺少 rules_file 应 400，got %d", rr.Code)
+	}
+	if rr := post(`{"type":"smartdns","rules_file":"etc/hosts"}`); rr.Code != http.StatusBadRequest {
+		t.Errorf("相对路径 rules_file 应 400，got %d", rr.Code)
+	}
+	// API 型实例仍然要求 url
+	if rr := post(`{"type":"adguard","url":""}`); rr.Code != http.StatusBadRequest {
+		t.Errorf("API 型缺 url 应 400，got %d", rr.Code)
+	}
+}
